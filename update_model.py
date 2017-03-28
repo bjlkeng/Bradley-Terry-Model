@@ -94,8 +94,8 @@ def compute_rank_scores(game_data, max_iters=100, error_tol=1e-3):
 
     del ranks[DUMMY_PLAYER]
 
-    # Scale score to be between 0 and 1000
-    ranks = (1000 * ranks.sort_values(ascending=False)).astype(int)
+    # Scale score to be between 1 and 1000
+    ranks = (1000 * ranks.sort_values(ascending=False)).astype(int).clip(1)
 
     return ranks
 
