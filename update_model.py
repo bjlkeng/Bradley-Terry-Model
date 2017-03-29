@@ -7,6 +7,7 @@ import pandas as pd
 import time
 
 from datetime import datetime
+from collections import Counter
 from oauth2client.service_account import ServiceAccountCredentials
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -54,7 +55,7 @@ def add_dummy_games(game_data, alpha=1):
     return df
 
 
-def compute_rank_scores(game_data, max_iters=100, error_tol=1e-3):
+def compute_rank_scores(game_data, max_iters=1000, error_tol=1e-3):
     ''' Computes Bradley-Terry using iterative algorithm
 
         See: https://en.wikipedia.org/wiki/Bradley%E2%80%93Terry_model
@@ -70,19 +71,19 @@ def compute_rank_scores(game_data, max_iters=100, error_tol=1e-3):
     wins = pd.concat([winsA, winsB]).groupby('Player').agg(sum)['Wins']
 
     # Total games played between pairs
-    num_games = {}
+    num_games = Counter()
     for index, row in game_data.iterrows():
         key = tuple(sorted([row['Player A'], row['Player B']]))
         total = sum([row['Wins A'], row['Wins B']])
-        num_games[key] = total
+        num_games[key] += total
 
     # Iteratively update 'ranks' scores
     players = sorted(list(set(game_data['Player A']) | set(game_data['Player B'])))
-    ranks = pd.Series(np.ones(len(players)), index=players)
-    for _ in range(max_iters):
+    ranks = pd.Series(np.ones(len(players)) / len(players), index=players)
+    for iters in range(max_iters):
         oldranks = ranks.copy()
         for player in ranks.index:
-            denom = np.sum(num_games.get(tuple(sorted([player, p])), 0.)
+            denom = np.sum(num_games[tuple(sorted([player, p]))]
                            / (ranks[p] + ranks[player])
                            for p in ranks.index if p != player)
             ranks[player] = 1.0 * wins[player] / denom
@@ -91,6 +92,11 @@ def compute_rank_scores(game_data, max_iters=100, error_tol=1e-3):
 
         if np.sum((ranks - oldranks).abs()) < error_tol:
             break
+
+    if np.sum((ranks - oldranks).abs()) < error_tol:
+        logging.info(" * Converged after %d iterations.", iters)
+    else:
+        logging.info(" * Max iterations reached (%d iters).", max_iters)
 
     del ranks[DUMMY_PLAYER]
 
@@ -159,6 +165,6 @@ if __name__ == "__main__":
     ranks = compute_rank_scores(game_data)
 
     logging.info("Uploading rank scores to sheet '%s'...", args.rank_sheet)
-    ranks = upload_to_gsheets(sheet, ranks, args.rank_sheet)
+    upload_to_gsheets(sheet, ranks, args.rank_sheet)
 
     logging.info("Done")
