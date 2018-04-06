@@ -100,8 +100,11 @@ def compute_rank_scores(game_data, max_iters=1000, error_tol=1e-3):
 
     del ranks[DUMMY_PLAYER]
 
-    # Scale score to be between 1 and 1000
-    ranks = (1000 * ranks.sort_values(ascending=False)).astype(int).clip(1)
+    # Scale logarithm of score to be between 1 and 1000
+    ranks = ranks.sort_values(ascending=False) \
+                 .apply(lambda x: np.log1p(1000 * x) / np.log1p(1000) * 1000) \
+                 .astype(int) \
+                 .clip(1)
 
     return ranks
 
