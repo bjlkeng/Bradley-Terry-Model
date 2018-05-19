@@ -45,10 +45,10 @@ def extract_game_data(sheet, sheet_name):
 
 
 def add_dummy_games(game_data, alpha=1):
-    ''' Regularizes the estimate by adding games against a dummy player.
+    """ Regularizes the estimate by adding games against a dummy player.
 
         :param alpha: regularization parameter, number dummy wins/loses to add
-    '''
+    """
     players = sorted(list(set(game_data['Player A']) | set(game_data['Player B'])))
 
     # Add dummy games
@@ -61,7 +61,8 @@ def add_dummy_games(game_data, alpha=1):
 
 
 def aggregate_data(game_data):
-    # Do some aggregations for convenience
+    """ Aggregates all quantities needed """
+
     # Total wins per player
     winsA = game_data.groupby('Player A').agg(sum)['Wins A'].reset_index()
     winsA = winsA[winsA['Wins A'] > 0]
@@ -85,20 +86,25 @@ def aggregate_data(game_data):
     return wins, num_games, win_games
 
 
-def normalize_ranks(ranks):
-    ''' Scale logarithm of score to be between 1 and 1000 '''
-    ranks /= sum(ranks)
-    return ranks.sort_values(ascending=False) \
-                .apply(lambda x: np.log1p(1000 * x) / np.log1p(1000) * 1000) \
+def normalize_ranks(ranks, col=None):
+    """ Scale logarithm of score to be between 1 and 1000 """
+    if isinstance(ranks, pd.Series):
+        ranks = ranks / sum(ranks)
+        ranks = ranks.sort_values(ascending=False)
+    else:
+        ranks = ranks / sum(ranks[col])
+        ranks = ranks.sort_values(col, ascending=False)
+
+    return ranks.apply(lambda x: np.log1p(1000 * x) / np.log1p(1000) * 1000) \
                 .astype(int) \
                 .clip(1)
 
 
 def compute_rank_scores(game_data, max_iters=1000, error_tol=1e-3):
-    ''' Computes Bradley-Terry using iterative algorithm
+    """ Computes Bradley-Terry using iterative algorithm
 
         See: https://en.wikipedia.org/wiki/Bradley%E2%80%93Terry_model
-    '''
+    """
     wins, games, _ = aggregate_data(game_data)
 
     # Iteratively update 'ranks' scores
@@ -127,63 +133,68 @@ def compute_rank_scores(game_data, max_iters=1000, error_tol=1e-3):
     return normalize_ranks(ranks)
 
 
-def lambda_prior(value):
-    # log(1000) ~= 6.9077
-    return bound(log(value / (1. + value) ** 2.), value > 0.0, value <= 6.9077)
+def find_interval(vals, central_val, alpha=0.5):
+    """ Find Bayesian posterior (credible) interval around center_val """
+    vals = vals.sort_values(ascending=True)
+    for index, v in enumerate(vals):
+        if central_val <= v:
+            break
+
+    add_left = True
+    left = right = index
+    while right - left < alpha * len(vals):
+        if add_left and left > 0:
+            left -= 1
+        elif right < len(vals) - 1:
+            right += 1
+        add_left = not add_left
+
+    return {
+        'Score (low)': vals.iloc[left],
+        'Score (central)': central_val,
+        'Score (high)': vals.iloc[right]
+    }
 
 
-def compute_bayes_rank_scores(game_data, max_iters=1000, error_tol=1e-3):
+def compute_bayes_rank_scores(game_data, num_tune_samples, num_samples, alpha):
+    """ Computes Bradley-Terry model using a full-Bayesian model using HMC
+        (flat prior assumed to be regularized with the dummy player)
+
+        :return: dataframe with 3 scores: the posterior mode and the alpha-%
+                 posterior interval centered on the posterior mode
+    """
+
     wins, games, win_games = aggregate_data(game_data)
-    logging.info(wins)
-    logging.info(games)
-    logging.info(win_games)
 
     logging.info(" * Building PyMC3 model...")
     model = pm.Model()
     with model:
         ranks = {}
-        for p in wins.index:
-            # x = pm.HalfFlat(p)
-            # Uniform = pm.Bound(pm.Uniform, lower=0.0)
-            # rawrank = pm.Bound(pm.DensityDist, lower=0.0)
-            rawrank = pm.DensityDist(p, lambda_prior, testval=1.)
-            ranks[p] = math.e ** rawrank
+        players = sorted(list(set(game_data['Player A']) | set(game_data['Player B'])))
+        for p in players:
+            Uniform = pm.Bound(pm.Flat, lower=0., upper=1.)
+            ranks[p] = Uniform(p, testval=0.5)
 
-        for a in wins.index:
-            for b in wins.index:
-                if win_games[(a, b)] > 0:
-                    obs = np.ones(win_games[(a, b)])
-                    pm.Bernoulli(a + b, p=ranks[a] / (ranks[a] + ranks[b]), observed=obs)
+        for (a, b), num_games in games.iteritems():
+            if num_games > 0:
+                pm.Binomial(a + b, n=num_games, p=ranks[a] / (ranks[a] + ranks[b]), observed=[win_games[(a, b)]])
 
-        logging.info(" * Fitting model...")
-        trace = pm.sample(50, cores=20, tune=50)
+        logging.info(" * Fitting MAP...")
+        map_estimate = pm.find_MAP(model=model)
+        map_score = pd.Series({k: float(v) for k, v in map_estimate.iteritems() if k in players})
 
-        #fns = [np.mean, np.std] + [lambda vals: np.percentile(vals, 10 * i) for i in range(10)]
-        df = pm.summary(trace, alpha=0.5)
-        logging.info(df)
-        logging.info(trace[0])
-        logging.info(type(trace[0]))
+        logging.info(" * Sampling HMC...")
+        trace = pm.sample(5000, cores=2, start=map_estimate, tune=num_tune_samples)
+        samples_hmc = pd.DataFrame({p: trace.get_values(p) for p in players})
 
-        # map_estimate = pm.find_MAP(model=model)
-        # ranks = pd.Series({k: float(v) for k, v in map_estimate.iteritems() if k in wins})
-        # logging.info(ranks)
-        # ranks = np.exp(pd.Series({k: float(v) for k, v in map_estimate.iteritems() if k in wins}))
-        ranks = normalize_ranks(ranks)
-        logging.info(ranks)
+    d = []
+    for p in players:
+        d.append(find_interval(samples_hmc[p], map_score[p], alpha=alpha))
 
-    assert False
-    #    # Priors for unknown model parameters
-    #    alpha = pm.Normal('alpha', mu=0, sd=10)
-    #    beta = pm.Normal('beta', mu=0, sd=10, shape=2)
-    #    sigma = pm.HalfNormal('sigma', sd=1)
+    scores = pd.DataFrame(d, index=players)[['Score (low)', 'Score (central)', 'Score (high)']]
+    scores = scores[scores.index != 'DUMMY PLAYER']
 
-    #    # Expected value of outcome
-    #    mu = alpha + beta[0]*X1 + beta[1]*X2
-
-    #    # Likelihood (sampling distribution) of observations
-    #    Y_obs = pm.Normal('Y_obs', mu=mu, sd=sigma, observed=Y)
-
-    pass
+    return normalize_ranks(scores, 'Score (central)')
 
 
 def upload_to_gsheets(sheet, ranks, rank_sheet):
@@ -194,21 +205,40 @@ def upload_to_gsheets(sheet, ranks, rank_sheet):
         worksheet = ranking_ws[0]
 
     worksheet.clear()
-    worksheet.update_cell(1, 1, 'Player')
-    worksheet.update_cell(1, 2, 'Score')
 
-    if worksheet.row_count < len(ranks) + 1:
-        worksheet.resize(rows=len(ranks) + 1, cols=25)
+    if isinstance(ranks, pd.Series):
+        worksheet.update_cell(1, 1, 'Player')
+        worksheet.update_cell(1, 2, 'Score')
 
-    player_cells = worksheet.range(2, 1, len(ranks) + 1, 1)
-    for cell, player in zip(player_cells, ranks.index):
-        cell.value = player
+        if worksheet.row_count < len(ranks) + 1:
+            worksheet.resize(rows=len(ranks) + 1, cols=25)
 
-    value_cells = worksheet.range(2, 2, len(ranks) + 1, 2)
-    for cell, val in zip(value_cells, ranks.values):
-        cell.value = val
+        player_cells = worksheet.range(2, 1, len(ranks) + 1, 1)
+        for cell, player in zip(player_cells, ranks.index):
+            cell.value = player
 
-    worksheet.update_cells(player_cells + value_cells)
+        value_cells = worksheet.range(2, 2, len(ranks) + 1, 2)
+        for cell, val in zip(value_cells, ranks.values):
+            cell.value = val
+
+        cells = player_cells + value_cells
+    else:
+        worksheet.update_cell(1, 1, 'Player')
+        player_cells = worksheet.range(2, 1, len(ranks) + 1, 1)
+        for cell, player in zip(player_cells, ranks.index):
+            cell.value = player
+
+        cells = player_cells
+        for i, col in enumerate(ranks.columns):
+            worksheet.update_cell(1, i + 2, col)
+
+            value_cells = worksheet.range(2, 2 + i, len(ranks) + 1, 2 + i)
+            for cell, val in zip(value_cells, ranks.iloc[:, i].values):
+                cell.value = val
+
+            cells += value_cells
+
+    worksheet.update_cells(cells)
 
 
 if __name__ == "__main__":
@@ -224,11 +254,17 @@ if __name__ == "__main__":
                         help='Name of worksheet containing game data')
     parser.add_argument('--rank-sheet', default='Ranking', type=str,
                         help='Name of worksheet to write rankings')
+    parser.add_argument('--num-samples', default=5000, type=int, help='Number of samples to draw for HMC')
+    parser.add_argument('--num-tune', default=500, type=int, help='Number of tuning samples to draw for HMC')
+    parser.add_argument('--interval', default=50, type=int, help="Size of interval for 'bayes' model (%%)")
     parser.add_argument('--alpha', default=1, type=int, help='Regularization parameter')
     args = parser.parse_args()
 
     if args.model not in ['point', 'bayes']:
-        raise ValueError("model should be one of 'point' or 'bayes'")
+        raise ValueError("--model should be one of 'point' or 'bayes'")
+
+    if args.interval > 99 or args.interval < 1:
+        raise ValueError("--inteval should be in [1, 99]")
 
     logging.info("Connecting to Google sheets '%s'...", args.sheet_key)
     sheet = connect_sheet(args.creds_file, args.sheet_key)
@@ -243,18 +279,19 @@ if __name__ == "__main__":
         game_data.to_csv(os.path.join(args.backup_dir, filename),
                          compression='gzip', index=False)
 
+    logging.info("Adding dummy game for regularization (alpha=%d)...", args.alpha)
+    game_data = add_dummy_games(game_data, args.alpha)
+
     logging.info("Computing rank scores...")
     if args.model == 'point':
-        logging.info("Adding dummy game for regularization (alpha=%d)...", args.alpha)
-        game_data = add_dummy_games(game_data, args.alpha)
         ranks = compute_rank_scores(game_data)
     else:
-        # logging.info("Adding dummy game for regularization (alpha=%d)...", args.alpha)
-        # game_data = add_dummy_games(game_data, args.alpha)
-        ranks = compute_bayes_rank_scores(game_data)
+        ranks = compute_bayes_rank_scores(game_data, args.num_tune,
+                                          args.num_samples, args.interval / 100.)
 
     logging.info(ranks)
+
     logging.info("Uploading rank scores to sheet '%s'...", args.rank_sheet)
-    # upload_to_gsheets(sheet, ranks, args.rank_sheet)
+    upload_to_gsheets(sheet, ranks, args.rank_sheet)
 
     logging.info("Done")
