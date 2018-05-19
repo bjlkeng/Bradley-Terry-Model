@@ -3,3 +3,4 @@ numpy
 gspread
 PyOpenSSL
 oauth2client
+pymc3
